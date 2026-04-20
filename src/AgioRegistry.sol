@@ -29,6 +29,8 @@ contract AgioRegistry is
         AgentTier tier;
     }
 
+    uint256 public registrationFee; // anti-spam fee in wei (default 0 for testnet)
+
     mapping(address => AgentInfo) private _agents;
     mapping(bytes32 => address) private _agentIdToWallet;
 
@@ -52,7 +54,10 @@ contract AgioRegistry is
     /// @notice Register a new agent identity
     /// @param agentId A unique identifier for this agent
     /// @param metadata JSON string with agent details
-    function registerAgent(bytes32 agentId, string calldata metadata) external {
+    /// @notice Register a new agent identity
+    /// @dev Requires registrationFee in native token to prevent spam
+    function registerAgent(bytes32 agentId, string calldata metadata) external payable {
+        require(msg.value >= registrationFee, "AgioRegistry: insufficient registration fee");
         require(_agents[msg.sender].registeredAt == 0, "AgioRegistry: already registered");
         require(_agentIdToWallet[agentId] == address(0), "AgioRegistry: agentId taken");
 
@@ -132,6 +137,15 @@ contract AgioRegistry is
 
     function isRegistered(address wallet) external view returns (bool) {
         return _agents[wallet].registeredAt > 0;
+    }
+
+    function setRegistrationFee(uint256 fee) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        registrationFee = fee;
+    }
+
+    function withdrawFees(address payable to) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        (bool ok,) = to.call{value: address(this).balance}("");
+        require(ok, "AgioRegistry: fee withdrawal failed");
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(UPGRADER_ROLE) {}

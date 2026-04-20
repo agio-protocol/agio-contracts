@@ -10,8 +10,8 @@ import {IAgioVault} from "./interfaces/IAgioVault.sol";
 import {IAgioRegistry} from "./interfaces/IAgioRegistry.sol";
 
 /// @title AgioBatchSettlement — Atomic batch payment processing for AGIO
-/// @notice Processes batches of agent-to-agent payments in a single transaction.
-///         Gas optimization is critical — this is where AGIO's economics live.
+/// @notice Security: max batch value cap, per-submitter rate limiting,
+///         replay protection, atomic execution.
 contract AgioBatchSettlement is
     Initializable,
     UUPSUpgradeable,
@@ -43,23 +43,18 @@ contract AgioBatchSettlement is
     IAgioVault public vault;
     IAgioRegistry public registry;
     uint256 public maxBatchSize;
+    uint256 public maxBatchValue;      // Feature: max USD value per batch
 
     mapping(bytes32 => BatchRecord) private _batches;
     mapping(bytes32 => bool) private _processedPayments;
 
-    event BatchSettled(
-        bytes32 indexed batchId,
-        uint256 totalPayments,
-        uint256 totalVolume,
-        uint256 timestamp
-    );
-    event PaymentSettled(
-        bytes32 indexed batchId,
-        bytes32 indexed paymentId,
-        address indexed from,
-        address to,
-        uint256 amount
-    );
+    // Feature: Rate limiting per submitter
+    uint256 public maxBatchesPerHour;
+    mapping(address => uint256) private _submitterWindowStart;
+    mapping(address => uint256) private _submitterBatchCount;
+
+    event BatchSettled(bytes32 indexed batchId, uint256 totalPayments, uint256 totalVolume, uint256 timestamp);
+    event PaymentSettled(bytes32 indexed batchId, bytes32 indexed paymentId, address indexed from, address to, uint256 amount);
     event BatchFailed(bytes32 indexed batchId, string reason);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -82,12 +77,11 @@ contract AgioBatchSettlement is
         vault = IAgioVault(_vault);
         registry = IAgioRegistry(_registry);
         maxBatchSize = _maxBatchSize;
+        maxBatchValue = 50_000e6;    // $50,000 default cap
+        maxBatchesPerHour = 60;      // rate limit
     }
 
     /// @notice Submit a batch of payments for atomic settlement
-    /// @dev Uses calldata for gas efficiency. Entire batch reverts if any payment fails.
-    /// @param payments Array of payments to process
-    /// @param batchId Unique identifier for this batch
     function submitBatch(
         BatchPayment[] calldata payments,
         bytes32 batchId
@@ -97,9 +91,11 @@ contract AgioBatchSettlement is
         require(len <= maxBatchSize, "AgioBatch: exceeds max batch size");
         require(_batches[batchId].timestamp == 0, "AgioBatch: duplicate batch ID");
 
+        // Rate limit check
+        _checkRateLimit(msg.sender);
+
         uint256 totalVolume;
 
-        // Process all payments — debit senders, credit receivers via vault
         for (uint256 i; i < len;) {
             BatchPayment calldata p = payments[i];
 
@@ -108,18 +104,18 @@ contract AgioBatchSettlement is
             require(!_processedPayments[p.paymentId], "AgioBatch: duplicate payment ID");
 
             _processedPayments[p.paymentId] = true;
-
             vault.debit(p.from, p.amount);
             vault.credit(p.to, p.amount);
 
             totalVolume += p.amount;
-
             emit PaymentSettled(batchId, p.paymentId, p.from, p.to, p.amount);
 
             unchecked { ++i; }
         }
 
-        // Record batch (packed struct for gas efficiency)
+        // Max batch value check
+        require(totalVolume <= maxBatchValue, "AgioBatch: exceeds max batch value");
+
         _batches[batchId] = BatchRecord({
             batchId: batchId,
             timestamp: uint64(block.timestamp),
@@ -129,7 +125,6 @@ contract AgioBatchSettlement is
             status: BatchStatus.Settled
         });
 
-        // Update registry stats if available
         if (address(registry) != address(0)) {
             _updateRegistryStats(payments);
         }
@@ -137,10 +132,20 @@ contract AgioBatchSettlement is
         emit BatchSettled(batchId, len, totalVolume, block.timestamp);
     }
 
-    /// @dev Updates agent stats in the registry. Aggregates per-agent to minimize calls.
+    /// @dev Rate limit: max batches per hour per submitter
+    function _checkRateLimit(address submitter) private {
+        if (block.timestamp > _submitterWindowStart[submitter] + 1 hours) {
+            _submitterWindowStart[submitter] = block.timestamp;
+            _submitterBatchCount[submitter] = 0;
+        }
+        _submitterBatchCount[submitter]++;
+        require(
+            _submitterBatchCount[submitter] <= maxBatchesPerHour,
+            "AgioBatch: rate limit exceeded"
+        );
+    }
+
     function _updateRegistryStats(BatchPayment[] calldata payments) private {
-        // Gas note: this iterates payments twice but avoids dynamic storage allocation.
-        // For production, consider an off-chain indexer updating stats instead.
         uint256 len = payments.length;
         for (uint256 i; i < len;) {
             try registry.incrementStats(payments[i].from, 1, payments[i].amount) {} catch {}
@@ -148,6 +153,8 @@ contract AgioBatchSettlement is
             unchecked { ++i; }
         }
     }
+
+    // --- View functions ---
 
     function getBatchStatus(bytes32 batchId) external view returns (BatchStatus) {
         return _batches[batchId].status;
@@ -161,8 +168,18 @@ contract AgioBatchSettlement is
         return _processedPayments[paymentId];
     }
 
+    // --- Admin ---
+
     function setMaxBatchSize(uint256 newMax) external onlyRole(DEFAULT_ADMIN_ROLE) {
         maxBatchSize = newMax;
+    }
+
+    function setMaxBatchValue(uint256 newMax) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxBatchValue = newMax;
+    }
+
+    function setMaxBatchesPerHour(uint256 newMax) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        maxBatchesPerHour = newMax;
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
