@@ -40,6 +40,13 @@ contract AgioVault is
     mapping(address => uint256) private _balances;
     mapping(address => uint256) private _lockedBalances;
 
+    // --- Feature: Balance Invariant ---
+    // Running sum of all tracked balances. Must always equal token.balanceOf(this).
+    // If it doesn't, something created or destroyed value — pause immediately.
+    uint256 public totalTrackedBalance;
+
+    event InvariantViolation(uint256 tracked, uint256 actual);
+
     // --- Feature: Tiered Withdrawal Delays ---
     uint256 public instantWithdrawLimit;     // below this: instant (default $1,000)
     uint256 public mediumWithdrawLimit;       // below this: 1hr delay (default $10,000)
@@ -100,8 +107,9 @@ contract AgioVault is
             "AgioVault: exceeds deposit cap"
         );
 
-        // EFFECTS before INTERACTIONS (CEI pattern — audit fix)
+        // EFFECTS before INTERACTIONS (CEI pattern)
         _balances[msg.sender] += amount;
+        totalTrackedBalance += amount;
 
         // INTERACTION last
         token.safeTransferFrom(msg.sender, address(this), amount);
@@ -143,6 +151,7 @@ contract AgioVault is
         uint256 amount = pw.amount;
         delete pendingWithdrawals[msg.sender];
         _lockedBalances[msg.sender] -= amount;
+        totalTrackedBalance -= amount;
 
         // Circuit breaker check
         _checkCircuitBreaker(amount);
@@ -170,6 +179,7 @@ contract AgioVault is
 
         // CEI: state before transfer
         _balances[agent] -= amount;
+        totalTrackedBalance -= amount;
         token.safeTransfer(agent, amount);
 
         emit Withdrawn(agent, amount, block.timestamp);
@@ -211,6 +221,29 @@ contract AgioVault is
 
     function credit(address agent, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
         _balances[agent] += amount;
+    }
+
+    // --- Balance Invariant Check ---
+    // THE MOST IMPORTANT SAFETY CHECK: if the books don't balance, pause everything.
+
+    /// @notice Verify that tracked balances match actual USDC held by the vault
+    /// @return ok True if invariant holds
+    /// @return tracked The sum of all tracked balances
+    /// @return actual The actual USDC balance of the contract
+    function checkInvariant() public view returns (bool ok, uint256 tracked, uint256 actual) {
+        tracked = totalTrackedBalance;
+        actual = token.balanceOf(address(this));
+        ok = (tracked == actual);
+    }
+
+    /// @notice Enforce the invariant — called by batch settlement after each batch.
+    ///         If it fails, auto-pauses everything.
+    function enforceInvariant() external {
+        (bool ok, uint256 tracked, uint256 actual) = checkInvariant();
+        if (!ok) {
+            _pause();
+            emit InvariantViolation(tracked, actual);
+        }
     }
 
     // --- Admin functions ---

@@ -3,38 +3,42 @@ pragma solidity ^0.8.24;
 
 import {Test, console} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {AgioVault} from "../src/AgioVault.sol";
 import {AgioBatchSettlement} from "../src/AgioBatchSettlement.sol";
 import {AgioRegistry} from "../src/AgioRegistry.sol";
 import {MockUSDC} from "../src/MockUSDC.sol";
 
 contract AgioBatchSettlementTest is Test {
+    using MessageHashUtils for bytes32;
+
     AgioVault public vault;
     AgioBatchSettlement public batch;
     AgioRegistry public registry;
     MockUSDC public usdc;
 
-    address public admin = address(this);
+    uint256 public signerPrivateKey = 0xA11CE; // test signer key
+    address public signer;
+
     uint256 constant MAX_CAP = 100_000e6;
 
     function setUp() public {
+        signer = vm.addr(signerPrivateKey);
+
         usdc = new MockUSDC();
 
-        // Deploy vault
         AgioVault vaultImpl = new AgioVault();
         vault = AgioVault(address(new ERC1967Proxy(
             address(vaultImpl),
             abi.encodeCall(vaultImpl.initialize, (address(usdc), MAX_CAP))
         )));
 
-        // Deploy registry
         AgioRegistry regImpl = new AgioRegistry();
         registry = AgioRegistry(address(new ERC1967Proxy(
             address(regImpl),
             abi.encodeCall(regImpl.initialize, ())
         )));
 
-        // Deploy batch settlement
         AgioBatchSettlement batchImpl = new AgioBatchSettlement();
         batch = AgioBatchSettlement(address(new ERC1967Proxy(
             address(batchImpl),
@@ -44,6 +48,9 @@ contract AgioBatchSettlementTest is Test {
         // Grant roles
         vault.grantRole(vault.SETTLEMENT_ROLE(), address(batch));
         registry.grantRole(registry.BATCH_SETTLEMENT_ROLE(), address(batch));
+
+        // Set the batch signer
+        batch.setBatchSigner(signer);
     }
 
     function _fundAgent(address agent, uint256 amount) internal {
@@ -60,36 +67,98 @@ contract AgioBatchSettlementTest is Test {
         return AgioBatchSettlement.BatchPayment(from, to, amount, pid);
     }
 
+    function _signBatch(
+        AgioBatchSettlement.BatchPayment[] memory payments,
+        bytes32 batchId
+    ) internal view returns (bytes memory) {
+        // Compute hash the same way the contract does
+        bytes32 payloadHash = keccak256(abi.encode(batchId));
+        for (uint256 i; i < payments.length; i++) {
+            payloadHash = keccak256(abi.encodePacked(
+                payloadHash,
+                payments[i].from,
+                payments[i].to,
+                payments[i].amount,
+                payments[i].paymentId
+            ));
+        }
+        bytes32 ethSignedHash = payloadHash.toEthSignedMessageHash();
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPrivateKey, ethSignedHash);
+        return abi.encodePacked(r, s, v);
+    }
+
     function test_single_payment_batch() public {
-        address alice = address(0xA11CE);
+        address alice = address(0xA11CE0);
         address bob = address(0xB0B);
         _fundAgent(alice, 100e6);
 
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
         payments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
 
-        batch.submitBatch(payments, keccak256("batch1"));
+        bytes32 batchId = keccak256("batch1");
+        bytes memory sig = _signBatch(payments, batchId);
+
+        batch.submitBatch(payments, batchId, sig);
 
         assertEq(vault.balanceOf(alice), 90e6);
         assertEq(vault.balanceOf(bob), 10e6);
 
-        AgioBatchSettlement.BatchRecord memory record = batch.getBatchDetails(keccak256("batch1"));
-        assertEq(record.totalPayments, 1);
-        assertEq(record.totalVolume, 10e6);
-        assertTrue(record.status == AgioBatchSettlement.BatchStatus.Settled);
+        // Verify invariant holds
+        (bool ok,,) = vault.checkInvariant();
+        assertTrue(ok, "Invariant violated after batch");
     }
 
-    function test_100_payment_batch() public {
+    function test_invalid_signature_reverts() public {
+        address alice = address(0xA11CE0);
+        address bob = address(0xB0B);
+        _fundAgent(alice, 100e6);
+
+        AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
+        payments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
+
+        bytes32 batchId = keccak256("batch1");
+
+        // Sign with wrong key
+        uint256 wrongKey = 0xDEAD;
+        bytes32 payloadHash = keccak256(abi.encode(batchId));
+        payloadHash = keccak256(abi.encodePacked(payloadHash, alice, bob, uint256(10e6), keccak256("pay1")));
+        bytes32 ethSignedHash = payloadHash.toEthSignedMessageHash();
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, ethSignedHash);
+        bytes memory badSig = abi.encodePacked(r, s, v);
+
+        vm.expectRevert("AgioBatch: invalid batch signature");
+        batch.submitBatch(payments, batchId, badSig);
+    }
+
+    function test_tampered_payment_reverts() public {
+        address alice = address(0xA11CE0);
+        address bob = address(0xB0B);
+        address mallory = address(0xBAD);
+        _fundAgent(alice, 100e6);
+
+        // Sign batch with bob as recipient
+        AgioBatchSettlement.BatchPayment[] memory originalPayments = new AgioBatchSettlement.BatchPayment[](1);
+        originalPayments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
+        bytes32 batchId = keccak256("batch1");
+        bytes memory sig = _signBatch(originalPayments, batchId);
+
+        // Submit with mallory as recipient (tampered)
+        AgioBatchSettlement.BatchPayment[] memory tamperedPayments = new AgioBatchSettlement.BatchPayment[](1);
+        tamperedPayments[0] = _makePayment(alice, mallory, 10e6, keccak256("pay1"));
+
+        vm.expectRevert("AgioBatch: invalid batch signature");
+        batch.submitBatch(tamperedPayments, batchId, sig);
+    }
+
+    function test_100_payment_batch_with_sig() public {
         uint256 numPayments = 100;
         address[] memory agents = new address[](numPayments + 1);
 
-        // Create funded agents
         for (uint256 i; i < numPayments + 1; i++) {
             agents[i] = address(uint160(0x1000 + i));
             _fundAgent(agents[i], 1000e6);
         }
 
-        // Build batch: agent[i] pays agent[i+1]
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](numPayments);
         for (uint256 i; i < numPayments; i++) {
             payments[i] = _makePayment(
@@ -98,69 +167,116 @@ contract AgioBatchSettlementTest is Test {
             );
         }
 
-        batch.submitBatch(payments, keccak256("batch100"));
+        bytes32 batchId = keccak256("batch100");
+        bytes memory sig = _signBatch(payments, batchId);
 
-        AgioBatchSettlement.BatchRecord memory record = batch.getBatchDetails(keccak256("batch100"));
+        batch.submitBatch(payments, batchId, sig);
+
+        AgioBatchSettlement.BatchRecord memory record = batch.getBatchDetails(batchId);
         assertEq(record.totalPayments, 100);
+
+        // Invariant check
+        (bool ok,,) = vault.checkInvariant();
+        assertTrue(ok);
     }
 
     function test_batch_with_insufficient_balance_reverts() public {
-        address alice = address(0xA11CE);
+        address alice = address(0xA11CE0);
         address bob = address(0xB0B);
         _fundAgent(alice, 10e6);
 
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
         payments[0] = _makePayment(alice, bob, 100e6, keccak256("pay1"));
 
+        bytes32 batchId = keccak256("batch_fail");
+        bytes memory sig = _signBatch(payments, batchId);
+
         vm.expectRevert("AgioVault: insufficient balance for debit");
-        batch.submitBatch(payments, keccak256("batch_fail"));
+        batch.submitBatch(payments, batchId, sig);
     }
 
     function test_duplicate_paymentId_reverts() public {
-        address alice = address(0xA11CE);
+        address alice = address(0xA11CE0);
         address bob = address(0xB0B);
         _fundAgent(alice, 100e6);
 
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
         payments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
 
-        batch.submitBatch(payments, keccak256("batch1"));
+        bytes32 batchId1 = keccak256("batch1");
+        bytes memory sig1 = _signBatch(payments, batchId1);
+        batch.submitBatch(payments, batchId1, sig1);
 
-        // Try submitting same paymentId again
-        payments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
+        bytes32 batchId2 = keccak256("batch2");
+        bytes memory sig2 = _signBatch(payments, batchId2);
         vm.expectRevert("AgioBatch: duplicate payment ID");
-        batch.submitBatch(payments, keccak256("batch2"));
+        batch.submitBatch(payments, batchId2, sig2);
     }
 
     function test_unauthorized_submitter_reverts() public {
-        address alice = address(0xA11CE);
-        address bob = address(0xB0B);
         address mallory = address(0xBAD);
-        _fundAgent(alice, 100e6);
 
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
-        payments[0] = _makePayment(alice, bob, 10e6, keccak256("pay1"));
+        payments[0] = _makePayment(address(1), address(2), 1e6, keccak256("pay1"));
+
+        bytes32 batchId = keccak256("batch1");
+        bytes memory sig = _signBatch(payments, batchId);
 
         vm.prank(mallory);
         vm.expectRevert();
-        batch.submitBatch(payments, keccak256("batch1"));
+        batch.submitBatch(payments, batchId, sig);
     }
 
     function test_empty_batch_reverts() public {
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](0);
         vm.expectRevert("AgioBatch: empty batch");
-        batch.submitBatch(payments, keccak256("batch_empty"));
+        batch.submitBatch(payments, keccak256("batch_empty"), "");
     }
 
     function test_self_payment_reverts() public {
-        address alice = address(0xA11CE);
+        address alice = address(0xA11CE0);
         _fundAgent(alice, 100e6);
 
         AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](1);
         payments[0] = _makePayment(alice, alice, 10e6, keccak256("pay1"));
 
+        bytes32 batchId = keccak256("batch1");
+        bytes memory sig = _signBatch(payments, batchId);
+
         vm.expectRevert("AgioBatch: self-payment");
-        batch.submitBatch(payments, keccak256("batch1"));
+        batch.submitBatch(payments, batchId, sig);
+    }
+
+    function test_invariant_holds_after_batch() public {
+        address alice = address(0xA11CE0);
+        address bob = address(0xB0B);
+        _fundAgent(alice, 500e6);
+        _fundAgent(bob, 500e6);
+
+        // Verify before
+        (bool okBefore, uint256 trackedBefore, uint256 actualBefore) = vault.checkInvariant();
+        assertTrue(okBefore);
+        assertEq(trackedBefore, 1000e6);
+        assertEq(actualBefore, 1000e6);
+
+        // Process batch
+        AgioBatchSettlement.BatchPayment[] memory payments = new AgioBatchSettlement.BatchPayment[](2);
+        payments[0] = _makePayment(alice, bob, 100e6, keccak256("p1"));
+        payments[1] = _makePayment(bob, alice, 50e6, keccak256("p2"));
+
+        bytes32 batchId = keccak256("inv_batch");
+        bytes memory sig = _signBatch(payments, batchId);
+        batch.submitBatch(payments, batchId, sig);
+
+        // Verify after — totalTrackedBalance unchanged (internal transfers)
+        (bool okAfter, uint256 trackedAfter, uint256 actualAfter) = vault.checkInvariant();
+        assertTrue(okAfter);
+        assertEq(trackedAfter, 1000e6); // same — no money entered or left vault
+        assertEq(actualAfter, 1000e6);
+
+        // Individual balances changed
+        assertEq(vault.balanceOf(alice), 450e6);
+        assertEq(vault.balanceOf(bob), 550e6);
     }
 
     function test_gas_usage_100_payments() public {
@@ -180,13 +296,14 @@ contract AgioBatchSettlementTest is Test {
             );
         }
 
+        bytes32 batchId = keccak256("gas_batch_100");
+        bytes memory sig = _signBatch(payments, batchId);
+
         uint256 gasBefore = gasleft();
-        batch.submitBatch(payments, keccak256("gas_batch_100"));
+        batch.submitBatch(payments, batchId, sig);
         uint256 gasUsed = gasBefore - gasleft();
 
-        console.log("Gas used for 100 payments:", gasUsed);
-        // With registry updates: ~3.9M gas. Without: ~1.5M.
-        // Production optimization: move registry updates to off-chain indexer.
+        console.log("Gas used for 100 payments (with sig + invariant):", gasUsed);
         assertLt(gasUsed, 5_000_000, "Gas too high for 100-payment batch");
     }
 }

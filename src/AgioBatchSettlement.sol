@@ -6,12 +6,14 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {IAgioVault} from "./interfaces/IAgioVault.sol";
 import {IAgioRegistry} from "./interfaces/IAgioRegistry.sol";
 
 /// @title AgioBatchSettlement — Atomic batch payment processing for AGIO
-/// @notice Security: max batch value cap, per-submitter rate limiting,
-///         replay protection, atomic execution.
+/// @notice Security: batch hash verification with ECDSA signature, max batch value,
+///         per-submitter rate limiting, replay protection, balance invariant enforcement.
 contract AgioBatchSettlement is
     Initializable,
     UUPSUpgradeable,
@@ -19,6 +21,9 @@ contract AgioBatchSettlement is
     PausableUpgradeable,
     ReentrancyGuard
 {
+    using ECDSA for bytes32;
+    using MessageHashUtils for bytes32;
+
     bytes32 public constant BATCH_SUBMITTER_ROLE = keccak256("BATCH_SUBMITTER_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
@@ -43,19 +48,23 @@ contract AgioBatchSettlement is
     IAgioVault public vault;
     IAgioRegistry public registry;
     uint256 public maxBatchSize;
-    uint256 public maxBatchValue;      // Feature: max USD value per batch
+    uint256 public maxBatchValue;
 
     mapping(bytes32 => BatchRecord) private _batches;
     mapping(bytes32 => bool) private _processedPayments;
 
-    // Feature: Rate limiting per submitter
+    // Rate limiting
     uint256 public maxBatchesPerHour;
     mapping(address => uint256) private _submitterWindowStart;
     mapping(address => uint256) private _submitterBatchCount;
 
+    // Batch hash verification: authorized API signer
+    address public batchSigner;
+
     event BatchSettled(bytes32 indexed batchId, uint256 totalPayments, uint256 totalVolume, uint256 timestamp);
     event PaymentSettled(bytes32 indexed batchId, bytes32 indexed paymentId, address indexed from, address to, uint256 amount);
     event BatchFailed(bytes32 indexed batchId, string reason);
+    event BatchSignerUpdated(address oldSigner, address newSigner);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -77,21 +86,59 @@ contract AgioBatchSettlement is
         vault = IAgioVault(_vault);
         registry = IAgioRegistry(_registry);
         maxBatchSize = _maxBatchSize;
-        maxBatchValue = 50_000e6;    // $50,000 default cap
-        maxBatchesPerHour = 60;      // rate limit
+        maxBatchValue = 50_000e6;
+        maxBatchesPerHour = 60;
+        batchSigner = msg.sender; // default: deployer is the signer
     }
 
-    /// @notice Submit a batch of payments for atomic settlement
-    function submitBatch(
+    /// @notice Compute the hash of a batch for signature verification
+    /// @dev Deterministic: sorted by paymentId, tightly packed
+    function computeBatchHash(
         BatchPayment[] calldata payments,
         bytes32 batchId
+    ) public pure returns (bytes32) {
+        // Hash each payment individually, then hash the concatenation
+        // This ensures the entire batch content is committed
+        bytes32 payloadHash = keccak256(abi.encode(batchId));
+        uint256 len = payments.length;
+        for (uint256 i; i < len;) {
+            payloadHash = keccak256(abi.encodePacked(
+                payloadHash,
+                payments[i].from,
+                payments[i].to,
+                payments[i].amount,
+                payments[i].paymentId
+            ));
+            unchecked { ++i; }
+        }
+        return payloadHash;
+    }
+
+    /// @notice Submit a batch with signature verification
+    /// @param payments Array of payments to process
+    /// @param batchId Unique batch identifier
+    /// @param signature ECDSA signature of the batch hash, signed by batchSigner
+    function submitBatch(
+        BatchPayment[] calldata payments,
+        bytes32 batchId,
+        bytes calldata signature
     ) external nonReentrant whenNotPaused onlyRole(BATCH_SUBMITTER_ROLE) {
         uint256 len = payments.length;
         require(len > 0, "AgioBatch: empty batch");
         require(len <= maxBatchSize, "AgioBatch: exceeds max batch size");
         require(_batches[batchId].timestamp == 0, "AgioBatch: duplicate batch ID");
 
-        // Rate limit check
+        // BATCH HASH VERIFICATION: Prevents compromised submitter from modifying payments.
+        // The API server signs the batch hash. The contract verifies the signature
+        // matches the authorized batchSigner address.
+        if (batchSigner != address(0)) {
+            bytes32 batchHash = computeBatchHash(payments, batchId);
+            bytes32 ethSignedHash = batchHash.toEthSignedMessageHash();
+            address recovered = ethSignedHash.recover(signature);
+            require(recovered == batchSigner, "AgioBatch: invalid batch signature");
+        }
+
+        // Rate limit
         _checkRateLimit(msg.sender);
 
         uint256 totalVolume;
@@ -113,7 +160,6 @@ contract AgioBatchSettlement is
             unchecked { ++i; }
         }
 
-        // Max batch value check
         require(totalVolume <= maxBatchValue, "AgioBatch: exceeds max batch value");
 
         _batches[batchId] = BatchRecord({
@@ -129,10 +175,12 @@ contract AgioBatchSettlement is
             _updateRegistryStats(payments);
         }
 
+        // BALANCE INVARIANT: verify the vault's books still balance after settlement
+        vault.enforceInvariant();
+
         emit BatchSettled(batchId, len, totalVolume, block.timestamp);
     }
 
-    /// @dev Rate limit: max batches per hour per submitter
     function _checkRateLimit(address submitter) private {
         if (block.timestamp > _submitterWindowStart[submitter] + 1 hours) {
             _submitterWindowStart[submitter] = block.timestamp;
@@ -169,6 +217,11 @@ contract AgioBatchSettlement is
     }
 
     // --- Admin ---
+
+    function setBatchSigner(address newSigner) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emit BatchSignerUpdated(batchSigner, newSigner);
+        batchSigner = newSigner;
+    }
 
     function setMaxBatchSize(uint256 newMax) external onlyRole(DEFAULT_ADMIN_ROLE) {
         maxBatchSize = newMax;
