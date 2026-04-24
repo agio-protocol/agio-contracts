@@ -1,3 +1,5 @@
+// Copyright (c) 2026 AGIO Protocol. All rights reserved.
+// Licensed under BUSL-1.1. See IP_NOTICE.md.
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -31,6 +33,7 @@ contract AgioBatchSettlement is
         address from;
         address to;
         uint256 amount;
+        address token;
         bytes32 paymentId;
     }
 
@@ -62,7 +65,7 @@ contract AgioBatchSettlement is
     address public batchSigner;
 
     event BatchSettled(bytes32 indexed batchId, uint256 totalPayments, uint256 totalVolume, uint256 timestamp);
-    event PaymentSettled(bytes32 indexed batchId, bytes32 indexed paymentId, address indexed from, address to, uint256 amount);
+    event PaymentSettled(bytes32 indexed batchId, bytes32 indexed paymentId, address indexed from, address to, address token, uint256 amount);
     event BatchFailed(bytes32 indexed batchId, string reason);
     event BatchSignerUpdated(address oldSigner, address newSigner);
 
@@ -107,6 +110,7 @@ contract AgioBatchSettlement is
                 payments[i].from,
                 payments[i].to,
                 payments[i].amount,
+                payments[i].token,
                 payments[i].paymentId
             ));
             unchecked { ++i; }
@@ -151,11 +155,11 @@ contract AgioBatchSettlement is
             require(!_processedPayments[p.paymentId], "AgioBatch: duplicate payment ID");
 
             _processedPayments[p.paymentId] = true;
-            vault.debit(p.from, p.amount);
-            vault.credit(p.to, p.amount);
+            vault.debit(p.from, p.token, p.amount);
+            vault.credit(p.to, p.token, p.amount);
 
             totalVolume += p.amount;
-            emit PaymentSettled(batchId, p.paymentId, p.from, p.to, p.amount);
+            emit PaymentSettled(batchId, p.paymentId, p.from, p.to, p.token, p.amount);
 
             unchecked { ++i; }
         }
@@ -175,8 +179,13 @@ contract AgioBatchSettlement is
             _updateRegistryStats(payments);
         }
 
-        // BALANCE INVARIANT: verify the vault's books still balance after settlement
-        vault.enforceInvariant();
+        // BALANCE INVARIANT: verify the vault's books still balance for each token used
+        // Debit/credit are internal transfers, so invariant should always hold,
+        // but we check as a defense-in-depth measure.
+        for (uint256 i; i < len;) {
+            vault.enforceInvariant(payments[i].token);
+            unchecked { ++i; }
+        }
 
         emit BatchSettled(batchId, len, totalVolume, block.timestamp);
     }

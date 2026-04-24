@@ -1,3 +1,5 @@
+// Copyright (c) 2026 AGIO Protocol. All rights reserved.
+// Licensed under BUSL-1.1. See IP_NOTICE.md.
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -64,6 +66,7 @@ contract X402Adapter is
                 from: payments[i].from,
                 to: payments[i].to,
                 amount: payments[i].amount,
+                token: payments[i].token,
                 paymentId: payments[i].externalId
             });
             volume += payments[i].amount;

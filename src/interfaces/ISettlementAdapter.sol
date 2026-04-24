@@ -9,6 +9,7 @@ interface ISettlementAdapter {
         address from;
         address to;
         uint256 amount;
+        address token;        // ERC-20 token address
         bytes32 externalId;   // ID from the calling protocol
         bytes metadata;       // protocol-specific data (memo, service type, etc.)
     }

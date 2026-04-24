@@ -1,3 +1,5 @@
+// Copyright (c) 2026 AGIO Protocol. All rights reserved.
+// Licensed under BUSL-1.1. See IP_NOTICE.md.
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
@@ -8,12 +10,12 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IAgioVault} from "./interfaces/IAgioVault.sol";
 
-/// @title AgioVault — Agent deposit/withdrawal vault for AGIO protocol
-/// @notice Agents deposit USDC here. Batch settlement debits/credits balances.
-/// @dev Security features: CEI pattern, circuit breaker, tiered withdrawal delays,
-///      multi-sig ready access control. See SECURITY.md for role assignment guide.
+/// @title AgioVault — Multi-token agent deposit/withdrawal vault
+/// @notice Supports any whitelisted ERC-20 token (USDC, USDT, DAI, WETH).
+///         Balances tracked per agent per token. Invariant checked per token.
 contract AgioVault is
     Initializable,
     UUPSUpgradeable,
@@ -23,60 +25,59 @@ contract AgioVault is
     IAgioVault
 {
     using SafeERC20 for IERC20;
+    using EnumerableSet for EnumerableSet.AddressSet;
 
-    // --- Roles ---
-    // MULTISIG GUIDE: Before mainnet, transfer these to Gnosis Safe:
-    //   DEFAULT_ADMIN_ROLE → 3-of-5 multisig (team founders)
-    //   UPGRADER_ROLE      → 4-of-5 multisig (highest security)
-    //   PAUSER_ROLE        → 2-of-3 multisig (ops team, fast response)
-    //   SETTLEMENT_ROLE    → batch settlement contract address (not a human)
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
     bytes32 public constant SETTLEMENT_ROLE = keccak256("SETTLEMENT_ROLE");
 
-    IERC20 public token;
     uint256 public maxDepositCap;
 
-    mapping(address => uint256) private _balances;
-    mapping(address => uint256) private _lockedBalances;
+    // Multi-token: agent → token → balance
+    mapping(address => mapping(address => uint256)) private _balances;
+    mapping(address => mapping(address => uint256)) private _lockedBalances;
 
-    // --- Feature: Balance Invariant ---
-    // Running sum of all tracked balances. Must always equal token.balanceOf(this).
-    // If it doesn't, something created or destroyed value — pause immediately.
-    uint256 public totalTrackedBalance;
+    // Per-token tracked total (for invariant check)
+    mapping(address => uint256) public totalTrackedBalance;
 
-    event InvariantViolation(uint256 tracked, uint256 actual);
+    // Token whitelist
+    EnumerableSet.AddressSet private _whitelistedTokens;
 
-    // --- Feature: Tiered Withdrawal Delays ---
-    uint256 public instantWithdrawLimit;     // below this: instant (default $1,000)
-    uint256 public mediumWithdrawLimit;       // below this: 1hr delay (default $10,000)
-    uint256 public mediumWithdrawDelay;       // 1 hour
-    uint256 public largeWithdrawDelay;        // 24 hours
+    event InvariantViolation(address indexed token, uint256 tracked, uint256 actual);
+    event TokenWhitelisted(address indexed token);
+    event TokenRemoved(address indexed token);
+
+    // Tiered withdrawal delays
+    uint256 public instantWithdrawLimit;
+    uint256 public mediumWithdrawLimit;
+    uint256 public mediumWithdrawDelay;
+    uint256 public largeWithdrawDelay;
 
     struct PendingWithdrawal {
+        address token;
         uint256 amount;
         uint64 requestedAt;
         uint64 availableAt;
     }
     mapping(address => PendingWithdrawal) public pendingWithdrawals;
 
-    event WithdrawalRequested(address indexed agent, uint256 amount, uint256 availableAt);
-    event WithdrawalCancelled(address indexed agent, uint256 amount);
+    event WithdrawalRequested(address indexed agent, address indexed token, uint256 amount, uint256 availableAt);
+    event WithdrawalCancelled(address indexed agent, address indexed token, uint256 amount);
 
-    // --- Feature: Circuit Breaker ---
-    uint256 public circuitBreakerThresholdBps; // basis points (default 2000 = 20%)
-    uint256 public circuitBreakerWindow;       // seconds (default 1 hour)
-    uint256 private _windowStart;
-    uint256 private _windowOutflows;
+    // Circuit breaker (per-token)
+    uint256 public circuitBreakerThresholdBps;
+    uint256 public circuitBreakerWindow;
+    mapping(address => uint256) private _windowStart;
+    mapping(address => uint256) private _windowOutflows;
 
-    event CircuitBreakerTriggered(uint256 outflows, uint256 threshold, uint256 window);
+    event CircuitBreakerTriggered(address indexed token, uint256 outflows, uint256 threshold);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    function initialize(address _token, uint256 _maxDepositCap) external initializer {
+    function initialize(uint256 _maxDepositCap) external initializer {
         __AccessControl_init();
         __Pausable_init();
 
@@ -84,199 +85,185 @@ contract AgioVault is
         _grantRole(PAUSER_ROLE, msg.sender);
         _grantRole(UPGRADER_ROLE, msg.sender);
 
-        token = IERC20(_token);
         maxDepositCap = _maxDepositCap;
-
-        // Withdrawal delay defaults (in USDC base units, 6 decimals)
-        instantWithdrawLimit = 1_000e6;    // $1,000
-        mediumWithdrawLimit = 10_000e6;    // $10,000
+        instantWithdrawLimit = 1_000e6;
+        mediumWithdrawLimit = 10_000e6;
         mediumWithdrawDelay = 1 hours;
         largeWithdrawDelay = 24 hours;
-
-        // Circuit breaker defaults
-        circuitBreakerThresholdBps = 2000; // 20%
+        circuitBreakerThresholdBps = 2000;
         circuitBreakerWindow = 1 hours;
     }
 
-    /// @notice Deposit USDC into the vault
-    /// @dev CEI PATTERN: checks → state update → external call
-    function deposit(uint256 amount) external nonReentrant whenNotPaused {
+    // --- Token Whitelist ---
+
+    function addWhitelistedToken(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(token != address(0), "AgioVault: zero address");
+        _whitelistedTokens.add(token);
+        emit TokenWhitelisted(token);
+    }
+
+    function removeWhitelistedToken(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(totalTrackedBalance[token] == 0, "AgioVault: token has balance");
+        _whitelistedTokens.remove(token);
+        emit TokenRemoved(token);
+    }
+
+    function isWhitelistedToken(address token) public view returns (bool) {
+        return _whitelistedTokens.contains(token);
+    }
+
+    function getWhitelistedTokens() external view returns (address[] memory) {
+        return _whitelistedTokens.values();
+    }
+
+    // --- Deposit / Withdraw ---
+
+    function deposit(address token, uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "AgioVault: zero amount");
+        require(isWhitelistedToken(token), "AgioVault: token not whitelisted");
         require(
-            _balances[msg.sender] + amount <= maxDepositCap,
+            _balances[msg.sender][token] + amount <= maxDepositCap,
             "AgioVault: exceeds deposit cap"
         );
 
-        // EFFECTS before INTERACTIONS (CEI pattern)
-        _balances[msg.sender] += amount;
-        totalTrackedBalance += amount;
+        // CEI: state before transfer
+        _balances[msg.sender][token] += amount;
+        totalTrackedBalance[token] += amount;
 
-        // INTERACTION last
-        token.safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
-        emit Deposited(msg.sender, amount, block.timestamp);
+        emit Deposited(msg.sender, token, amount, block.timestamp);
     }
 
-    /// @notice Withdraw USDC — instant for small amounts, delayed for large
-    /// @param amount Amount to withdraw
-    function withdraw(uint256 amount) external nonReentrant whenNotPaused {
+    function withdraw(address token, uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "AgioVault: zero amount");
-        require(_balances[msg.sender] >= amount, "AgioVault: insufficient balance");
+        require(_balances[msg.sender][token] >= amount, "AgioVault: insufficient balance");
 
         if (amount <= instantWithdrawLimit) {
-            // Instant withdrawal for small amounts
-            _executeWithdraw(msg.sender, amount);
+            _executeWithdraw(msg.sender, token, amount);
         } else {
-            // Queue delayed withdrawal
             uint256 delay = amount <= mediumWithdrawLimit ? mediumWithdrawDelay : largeWithdrawDelay;
-            _balances[msg.sender] -= amount;
-            _lockedBalances[msg.sender] += amount;
+            _balances[msg.sender][token] -= amount;
+            _lockedBalances[msg.sender][token] += amount;
 
             pendingWithdrawals[msg.sender] = PendingWithdrawal({
+                token: token,
                 amount: amount,
                 requestedAt: uint64(block.timestamp),
                 availableAt: uint64(block.timestamp + delay)
             });
 
-            emit WithdrawalRequested(msg.sender, amount, block.timestamp + delay);
+            emit WithdrawalRequested(msg.sender, token, amount, block.timestamp + delay);
         }
     }
 
-    /// @notice Execute a previously queued delayed withdrawal
     function executeDelayedWithdrawal() external nonReentrant whenNotPaused {
         PendingWithdrawal memory pw = pendingWithdrawals[msg.sender];
         require(pw.amount > 0, "AgioVault: no pending withdrawal");
         require(block.timestamp >= pw.availableAt, "AgioVault: withdrawal not yet available");
 
+        address token = pw.token;
         uint256 amount = pw.amount;
         delete pendingWithdrawals[msg.sender];
-        _lockedBalances[msg.sender] -= amount;
-        totalTrackedBalance -= amount;
+        _lockedBalances[msg.sender][token] -= amount;
+        totalTrackedBalance[token] -= amount;
 
-        // Circuit breaker check
-        _checkCircuitBreaker(amount);
+        _checkCircuitBreaker(token, amount);
 
-        token.safeTransfer(msg.sender, amount);
-        emit Withdrawn(msg.sender, amount, block.timestamp);
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit Withdrawn(msg.sender, token, amount, block.timestamp);
     }
 
-    /// @notice Cancel a pending delayed withdrawal
     function cancelDelayedWithdrawal() external {
         PendingWithdrawal memory pw = pendingWithdrawals[msg.sender];
         require(pw.amount > 0, "AgioVault: no pending withdrawal");
 
-        uint256 amount = pw.amount;
         delete pendingWithdrawals[msg.sender];
-        _lockedBalances[msg.sender] -= amount;
-        _balances[msg.sender] += amount;
+        _lockedBalances[msg.sender][pw.token] -= pw.amount;
+        _balances[msg.sender][pw.token] += pw.amount;
 
-        emit WithdrawalCancelled(msg.sender, amount);
+        emit WithdrawalCancelled(msg.sender, pw.token, pw.amount);
     }
 
-    function _executeWithdraw(address agent, uint256 amount) private {
-        // Circuit breaker check
-        _checkCircuitBreaker(amount);
-
-        // CEI: state before transfer
-        _balances[agent] -= amount;
-        totalTrackedBalance -= amount;
-        token.safeTransfer(agent, amount);
-
-        emit Withdrawn(agent, amount, block.timestamp);
+    function _executeWithdraw(address agent, address token, uint256 amount) private {
+        _checkCircuitBreaker(token, amount);
+        _balances[agent][token] -= amount;
+        totalTrackedBalance[token] -= amount;
+        IERC20(token).safeTransfer(agent, amount);
+        emit Withdrawn(agent, token, amount, block.timestamp);
     }
 
-    /// @dev Circuit breaker: auto-pauses if outflows exceed threshold in window
-    function _checkCircuitBreaker(uint256 outflow) private {
-        if (block.timestamp > _windowStart + circuitBreakerWindow) {
-            _windowStart = block.timestamp;
-            _windowOutflows = 0;
+    function _checkCircuitBreaker(address token, uint256 outflow) private {
+        if (block.timestamp > _windowStart[token] + circuitBreakerWindow) {
+            _windowStart[token] = block.timestamp;
+            _windowOutflows[token] = 0;
         }
-
-        _windowOutflows += outflow;
-        uint256 totalBalance = token.balanceOf(address(this));
-        uint256 threshold = (totalBalance + _windowOutflows) * circuitBreakerThresholdBps / 10000;
-
-        if (_windowOutflows > threshold) {
+        _windowOutflows[token] += outflow;
+        uint256 totalBalance = IERC20(token).balanceOf(address(this));
+        uint256 threshold = (totalBalance + _windowOutflows[token]) * circuitBreakerThresholdBps / 10000;
+        if (_windowOutflows[token] > threshold) {
             _pause();
-            emit CircuitBreakerTriggered(_windowOutflows, threshold, circuitBreakerWindow);
+            emit CircuitBreakerTriggered(token, _windowOutflows[token], threshold);
         }
     }
 
-    // --- Balance queries ---
+    // --- Balance Queries ---
 
-    function balanceOf(address agent) external view returns (uint256) {
-        return _balances[agent];
+    function balanceOf(address agent, address token) external view returns (uint256) {
+        return _balances[agent][token];
     }
 
-    function lockedBalanceOf(address agent) external view returns (uint256) {
-        return _lockedBalances[agent];
+    function lockedBalanceOf(address agent, address token) external view returns (uint256) {
+        return _lockedBalances[agent][token];
     }
 
-    // --- Settlement interface (called by batch contract) ---
+    // --- Settlement Interface ---
 
-    function debit(address agent, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
-        require(_balances[agent] >= amount, "AgioVault: insufficient balance for debit");
-        _balances[agent] -= amount;
+    function debit(address agent, address token, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
+        require(_balances[agent][token] >= amount, "AgioVault: insufficient balance for debit");
+        _balances[agent][token] -= amount;
     }
 
-    function credit(address agent, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
-        _balances[agent] += amount;
+    function credit(address agent, address token, uint256 amount) external onlyRole(SETTLEMENT_ROLE) {
+        _balances[agent][token] += amount;
     }
 
-    // --- Balance Invariant Check ---
-    // THE MOST IMPORTANT SAFETY CHECK: if the books don't balance, pause everything.
+    // --- Per-Token Invariant ---
 
-    /// @notice Verify that tracked balances match actual USDC held by the vault
-    /// @return ok True if invariant holds
-    /// @return tracked The sum of all tracked balances
-    /// @return actual The actual USDC balance of the contract
-    function checkInvariant() public view returns (bool ok, uint256 tracked, uint256 actual) {
-        tracked = totalTrackedBalance;
-        actual = token.balanceOf(address(this));
+    function checkInvariant(address token) public view returns (bool ok, uint256 tracked, uint256 actual) {
+        tracked = totalTrackedBalance[token];
+        actual = IERC20(token).balanceOf(address(this));
         ok = (tracked == actual);
     }
 
-    /// @notice Enforce the invariant — called by batch settlement after each batch.
-    ///         If it fails, auto-pauses everything.
-    function enforceInvariant() external {
-        (bool ok, uint256 tracked, uint256 actual) = checkInvariant();
+    function enforceInvariant(address token) external {
+        (bool ok, uint256 tracked, uint256 actual) = checkInvariant(token);
         if (!ok) {
             _pause();
-            emit InvariantViolation(tracked, actual);
+            emit InvariantViolation(token, tracked, actual);
         }
     }
 
-    // --- Admin functions ---
+    // --- Admin ---
 
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
-    }
-
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
-    }
+    function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
+    function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }
 
     function setMaxDepositCap(uint256 newCap) external onlyRole(DEFAULT_ADMIN_ROLE) {
         maxDepositCap = newCap;
     }
 
-    function setWithdrawLimits(
-        uint256 _instant,
-        uint256 _medium,
-        uint256 _mediumDelay,
-        uint256 _largeDelay
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setWithdrawLimits(uint256 _instant, uint256 _medium, uint256 _mDelay, uint256 _lDelay)
+        external onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         instantWithdrawLimit = _instant;
         mediumWithdrawLimit = _medium;
-        mediumWithdrawDelay = _mediumDelay;
-        largeWithdrawDelay = _largeDelay;
+        mediumWithdrawDelay = _mDelay;
+        largeWithdrawDelay = _lDelay;
     }
 
-    function setCircuitBreaker(
-        uint256 _thresholdBps,
-        uint256 _window
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        circuitBreakerThresholdBps = _thresholdBps;
+    function setCircuitBreaker(uint256 _bps, uint256 _window) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        circuitBreakerThresholdBps = _bps;
         circuitBreakerWindow = _window;
     }
 
